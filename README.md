@@ -1,9 +1,33 @@
 # HotConfig
 mange configure hot reload
 
+## 背景
+写代码中经常碰见有自动加载更新配置的需求,但可能有不想重启服务, 这个时候就需要热加载的支持,
+为了复用代码, 现在专门抽象出管理配置的逻辑,实现高效编码
+
+## 思路
+1. 使用一个统一的热配置管理器管理所有需要热更新的配置: HotConfig::HotConfigManager
+    * 支持定时轮询检测
+2. 现阶段对于具体配置, 常见为文件热更新, 使用 HotConfig::FileConfig包装具体的配置对象
+
+## 功能
+* 使用智能指针管理配置对象, 实时从热配置管理器获取最新配置并保证数据安全无内存泄漏风险
+* 线程安全
+* 基于模板的实现使之能够支持任意的数据对象
+* 轮询检查是否更新配置
+
 ## 使用
 
-直接将头文件拷贝过去即可使用, 例子:
+1. 初始化一个管理器对象
+2. 使用FileConfig包装你的具体对象, 如: HotConfig::FileConfig<MyConfigObject>
+3. 设置对象的属性:
+    * 对象初始函数调用: std::function<bool(MyConfigObject*)>
+    * 对象加载函数调用: std::function<bool(MyConfigObject*)>
+    * 监听文件路径及其检测函数
+4. 将FileConfig对象放入管理器中
+
+
+例子:
 ```
 int main() {
     HotConfig::HotConfigManager hotcmanager;  // 初始化管理器

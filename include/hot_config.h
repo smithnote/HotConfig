@@ -74,7 +74,7 @@ class FileConfig : public BaseConfig {
         return true;
     }
     
-    bool load() {
+    virtual bool load() {
         auto new_config = std::make_shared<T>();
         if (init_func_ && !init_func_(new_config.get())) {
             return false;
@@ -87,7 +87,7 @@ class FileConfig : public BaseConfig {
         return true;
     }
     
-    bool needUpdate() {
+    virtual bool needUpdate() {
         for (auto &p: file_map_) {
             if (!file_detects_.count(p.first)) {
                 continue;
@@ -105,6 +105,7 @@ class FileConfig : public BaseConfig {
         return config_ptr_;
     }
 
+  public:
     static bool fileMTimeUpdated(const std::string &file_path,
                                  std::string &mtime) {
         if (file_path.empty()) {
@@ -137,6 +138,8 @@ class FileConfig : public BaseConfig {
 class HotConfigManager {
   public:
     HotConfigManager() : check_interval_(10), running_(false) {}
+    HotConfigManager(const HotConfigManager&) = delete;
+    HotConfigManager& operator=(const HotConfigManager&) = delete;
     ~HotConfigManager() {
         stop();
     }
@@ -190,9 +193,15 @@ class HotConfigManager {
         return p->get();
     }
     
-    bool loadAll();
+    bool loadAll() {
+        for (size_t i = 0; i < config_pool_.size(); ++i) {
+            auto config_ptr = config_pool_[i];
+            config_ptr->load();
+        }
+        return true;
+    }
 
-  public:
+  private:
     bool cycleReload() {
         while (running_) {
             std::cerr << "runing cycleReload" << std::endl;
