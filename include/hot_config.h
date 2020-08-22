@@ -22,6 +22,7 @@
 #include <mutex>
 #include <condition_variable>
 
+#include "thread_pool.h"
 
 namespace HotConfig {
     
@@ -124,7 +125,7 @@ class FileConfig : public BaseConfig {
         return true;
     }
 
-  public:
+  private:
     std::mutex mutex_;
     std::map<std::string, std::string> file_map_;
     std::map<std::string,
@@ -148,6 +149,8 @@ class HotConfigManager {
          running_ = true;
          reload_thread_ = std::make_shared<std::thread>(&HotConfigManager::cycleReload,
                                                         this);
+         reload_pool_ = std::make_shared<HotConfig::ThreadPool>();
+         reload_pool_->start();
          return true;
     }
 
@@ -156,6 +159,7 @@ class HotConfigManager {
             running_ = false;
             exit_cond_.notify_all();
             reload_thread_->join();
+            reload_pool_->stop();
         }
         return true;
     }
@@ -196,7 +200,7 @@ class HotConfigManager {
     bool loadAll() {
         for (size_t i = 0; i < config_pool_.size(); ++i) {
             auto config_ptr = config_pool_[i];
-            config_ptr->load();
+            reload_pool_->push([config_ptr](){config_ptr->load();});
         }
         return true;
     }
@@ -208,8 +212,7 @@ class HotConfigManager {
             for (size_t i = 0; i < config_pool_.size(); ++i) {
                 auto config_ptr = config_pool_[i];
                 if (running_ && config_ptr->needUpdate()) {
-                    std::cerr << "reload config:" << i << std::endl;
-                    config_ptr->load();
+                    reload_pool_->push([config_ptr](){config_ptr->load();});
                 }
             }
             if (!running_) {
@@ -230,6 +233,7 @@ class HotConfigManager {
     std::vector<std::shared_ptr<BaseConfig>> config_pool_;
     std::mutex exit_mutex_;
     std::condition_variable exit_cond_;
+    std::shared_ptr<HotConfig::ThreadPool> reload_pool_;
 };
 
 }
