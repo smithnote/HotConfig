@@ -9,6 +9,7 @@ mange configure hot reload
 1. 使用一个统一的热配置管理器管理所有需要热更新的配置: HotConfig::HotConfigManager
     * 支持定时轮询检测
 2. 现阶段对于具体配置, 常见为文件热更新, 使用 HotConfig::FileConfig包装具体的配置对象
+3. 基于c++11
 
 ## 功能
 * 使用智能指针管理配置对象, 实时从热配置管理器获取最新配置并保证数据安全无内存泄漏风险
@@ -60,3 +61,8 @@ int main() {
 }
 
 ```
+
+## 计划
+1. 单线程检测, 线程池实际加载  :heavy_check_mark:
+2. 支持事件驱动更新:heavy_check_mark:
+3. 支持外部手动触发调度更新

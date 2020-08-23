@@ -5,13 +5,19 @@
 #ifndef HOT_CONFIG_H_ 
 #define HOT_CONFIG_H_ 
 
+#include <error.h>
+#include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/inotify.h>
+#include <sys/epoll.h>
 #include <unistd.h>
 #include <queue>
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <iostream>
 #include <vector>
 #include <set>
 #include <map>
@@ -22,6 +28,7 @@
 #include <mutex>
 #include <condition_variable>
 
+#include "thread_pool.h"
 
 namespace HotConfig {
     
@@ -33,16 +40,20 @@ class BaseConfig {
     virtual bool load() = 0;
     
     virtual bool needUpdate() = 0;
+
+    virtual int getPassive() {
+        return -1;
+    };
 };
 
 
 template<typename T>
 class FileConfig : public BaseConfig {
   public:
-    FileConfig() {}
+    FileConfig() : fd_(-1) {}
     FileConfig(std::function<bool(T*)> &&init_func,
                std::function<bool(T*)> &&load_func)
-            : init_func_(init_func), load_func_(load_func) {}
+             : fd_(-1), init_func_(init_func), load_func_(load_func) { }
     ~FileConfig() {}
 
     template<typename F, typename... Args>
@@ -73,6 +84,11 @@ class FileConfig : public BaseConfig {
         }
         return true;
     }
+
+    bool setPassive(const std::function<bool(int&,
+                const std::map<std::string, std::string>)> &&func = fileInotify) {
+        return func(fd_, file_map_);
+    }
     
     virtual bool load() {
         auto new_config = std::make_shared<T>();
@@ -100,6 +116,10 @@ class FileConfig : public BaseConfig {
         return false;
     }
 
+    virtual int getPassive() {
+        return fd_;
+    }
+
     std::shared_ptr<T> get() {
         std::lock_guard<std::mutex> lock(mutex_);
         return config_ptr_;
@@ -119,12 +139,27 @@ class FileConfig : public BaseConfig {
         if (mtime == new_mtime) {
             return false;
         }
-        std::cerr << "new time:" << new_mtime << ", old time:" << mtime << std::endl;
         mtime = new_mtime;
         return true;
     }
 
-  public:
+    static bool fileInotify(int &fd, const std::map<std::string, std::string> &files) {
+        fd = inotify_init();
+        if (fd == -1) {
+            return false;
+        }
+        for (auto &p: files) {
+            int ret = inotify_add_watch(fd, p.first.c_str(), IN_CREATE|IN_MODIFY);
+            if (ret == -1) {
+                fd = -1;
+                return false;
+            }
+        }
+        return true;
+    }
+
+  private:
+    int fd_;
     std::mutex mutex_;
     std::map<std::string, std::string> file_map_;
     std::map<std::string,
@@ -145,17 +180,25 @@ class HotConfigManager {
     }
 
     bool start() {
-         running_ = true;
-         reload_thread_ = std::make_shared<std::thread>(&HotConfigManager::cycleReload,
-                                                        this);
-         return true;
+        if (running_) {
+            return true;
+        }
+        running_ = true;
+        passive_thread_.reset(new std::thread(&HotConfigManager::passiveReload, this));
+        cycle_thread_.reset(new std::thread(&HotConfigManager::cycleReload, this));
+        reload_pool_ = std::make_shared<HotConfig::ThreadPool>();
+        reload_pool_->start();
+        return true;
     }
 
     bool stop() {
         if (running_) {
             running_ = false;
             exit_cond_.notify_all();
-            reload_thread_->join();
+            cycle_thread_->join();
+            write(stop_pipe_[1], "a", 1);
+            passive_thread_->join();
+            reload_pool_->stop();
         }
         return true;
     }
@@ -167,11 +210,12 @@ class HotConfigManager {
         if (key.empty() || !config) {
             return false;
         }
-        if (config_map_.count(key) && !recover) {
+        if (key_map_.count(key) && !recover) {
             return false;
         }
-        if (config_map_.count(key)) {
-            size_t idx = config_map_.find(key)->second;
+        std::unique_lock<std::mutex> lock(config_mutex_);
+        if (key_map_.count(key)) {
+            size_t idx = key_map_.find(key)->second;
             if (idx >= config_pool_.size()) {
                 return false;
             }
@@ -179,24 +223,31 @@ class HotConfigManager {
             config_pool_[idx].swap(cfg);
         } else {
             config_pool_.push_back(config);
-            config_map_[key] = config_pool_.size()-1;
+            key_map_[key] = config_pool_.size()-1;
+        }
+        int fd = config->getPassive();
+        if (fd != -1) {
+            addPassive(fd);
+            fd_map_[fd] = key_map_[key];
         }
         return true;
     }
     
     template<template<typename R> class T, typename R>
     std::shared_ptr<R> get(const std::string &key) {
-        if (!config_map_.count(key)) {
+        if (!key_map_.count(key)) {
             return std::shared_ptr<R>();
         }
-        auto p = std::dynamic_pointer_cast<T<R>>(config_pool_[config_map_[key]]);
+        std::unique_lock<std::mutex> lock(config_mutex_);
+        auto p = std::dynamic_pointer_cast<T<R>>(config_pool_[key_map_[key]]);
+        lock.unlock();
         return p->get();
     }
     
     bool loadAll() {
         for (size_t i = 0; i < config_pool_.size(); ++i) {
             auto config_ptr = config_pool_[i];
-            config_ptr->load();
+            reload_pool_->push([config_ptr](){config_ptr->load();});
         }
         return true;
     }
@@ -204,12 +255,13 @@ class HotConfigManager {
   private:
     bool cycleReload() {
         while (running_) {
-            std::cerr << "runing cycleReload" << std::endl;
             for (size_t i = 0; i < config_pool_.size(); ++i) {
                 auto config_ptr = config_pool_[i];
+                if (config_ptr->getPassive() != -1) {
+                    continue;
+                }
                 if (running_ && config_ptr->needUpdate()) {
-                    std::cerr << "reload config:" << i << std::endl;
-                    config_ptr->load();
+                    reload_pool_->push([config_ptr](){config_ptr->load();});
                 }
             }
             if (!running_) {
@@ -222,14 +274,66 @@ class HotConfigManager {
         return true;
     }
 
+    bool passiveReload() {
+        epoll_fd_ = epoll_create(1);
+        if (epoll_fd_ == -1) {
+            return false;
+        }
+        if (pipe(stop_pipe_) == -1 || !addPassive(stop_pipe_[0])) {
+            return false;
+        }
+        char buffer[1024];
+        struct epoll_event events[10];
+        while (true) {
+            int nfds = epoll_wait(epoll_fd_, events, 10, -1);
+            if (nfds < 0 && errno == EINTR) {
+                continue;
+            }
+            if (nfds < 0) {
+                return false;
+            }
+            for (int i = 0; i < nfds; ++i) {
+                int fd = events[i].data.fd;
+                if (fd == stop_pipe_[0]) {
+                    return true;
+                }
+                if (!fd_map_.count(fd)) {
+                    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, &events[i]);
+                } else {
+                    read(fd, (void*)buffer, 1024);
+                    auto config_ptr = config_pool_[fd_map_[fd]];
+                    reload_pool_->push([config_ptr](){config_ptr->load();});
+                }
+            }
+        }
+        return true;
+    }
+
+    bool addPassive(int fd) {
+        if (fd == -1) {
+            return false;
+        }
+        struct epoll_event pevent;
+        pevent.data.fd = fd;
+        pevent.events = EPOLLIN | EPOLLET;
+        epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &pevent);
+        return true;
+    }
+
   private:
+    int epoll_fd_;
+    int stop_pipe_[2];
     size_t check_interval_;
     std::atomic<bool> running_;
-    std::shared_ptr<std::thread> reload_thread_;
-    std::map<std::string, size_t> config_map_;
+    std::shared_ptr<std::thread> passive_thread_;
+    std::shared_ptr<std::thread> cycle_thread_;
+    std::map<std::string, size_t> key_map_;
+    std::map<int, size_t> fd_map_;
     std::vector<std::shared_ptr<BaseConfig>> config_pool_;
+    std::mutex config_mutex_;
     std::mutex exit_mutex_;
     std::condition_variable exit_cond_;
+    std::shared_ptr<HotConfig::ThreadPool> reload_pool_;
 };
 
 }
