@@ -96,28 +96,50 @@ TEST_F(HotConfigTest, FileConfig) {
 
 TEST_F(HotConfigTest, HotConfigManager) {
     HotConfig::HotConfigManager hotcmanager;
-    std::string fname = "/tmp/1.txt";
-    std::string key = "my_config_key";
-    system("seq 8 > /tmp/1.txt");
-    auto file_config = std::make_shared<HotConfig::FileConfig<MyConfig>>();
-    ASSERT_EQ(file_config->setInit(&MyConfig::initilization, true), true);
-    ASSERT_EQ(file_config->setLoad(&MyConfig::loadValue, "/tmp/1.txt"), true);
-    ASSERT_EQ(file_config->setWatch("/tmp/1.txt"), true);
-    ASSERT_EQ(file_config->load(), true);
-    std::cerr << file_config->get() << std::endl;
-    ASSERT_EQ(hotcmanager.add(key, file_config), true);
-    hotcmanager.start();
-    std::shared_ptr<MyConfig> vp;
-    vp = hotcmanager.get<HotConfig::FileConfig, MyConfig>(key);
-    std::cerr << vp.get() << std::endl;
-    ASSERT_EQ(vp != nullptr, true);
-    ASSERT_EQ(vp->vm.size(), 8);
-    sleep(5);
-    system("seq 8 16 >> /tmp/1.txt");
-    sleep(10);
-    auto p = hotcmanager.get<HotConfig::FileConfig, MyConfig>(key);
-    std::cerr << p.get() << std::endl;
-    ASSERT_EQ(p.get()->vm.size(), 16);
+    {
+        system("seq 8 > /tmp/1.txt");
+        auto file_config = std::make_shared<HotConfig::FileConfig<MyConfig>>();
+        ASSERT_EQ(file_config->setInit(&MyConfig::initilization, true), true);
+        ASSERT_EQ(file_config->setLoad(&MyConfig::loadValue, "/tmp/1.txt"), true);
+        ASSERT_EQ(file_config->setWatch("/tmp/1.txt"), true);
+        ASSERT_EQ(file_config->load(), true);
+        std::cerr << file_config->get() << std::endl;
+        std::cerr << "11111, fd:" << file_config->getPassive() << std::endl;
+        std::string key = "my_config_key";
+        ASSERT_EQ(hotcmanager.add(key, file_config), true);
+        hotcmanager.start();
+        std::shared_ptr<MyConfig> vp;
+        vp = hotcmanager.get<HotConfig::FileConfig, MyConfig>(key);
+        std::cerr << vp.get() << std::endl;
+        ASSERT_EQ(vp != nullptr, true);
+        ASSERT_EQ(vp->vm.size(), 8);
+        sleep(5);
+        system("seq 8 16 >> /tmp/1.txt");
+        sleep(10);
+        auto p = hotcmanager.get<HotConfig::FileConfig, MyConfig>(key);
+        std::cerr << p.get() << std::endl;
+        ASSERT_EQ(p.get()->vm.size(), 16);
+    }
+    {
+        std::cerr << "111111111111111111111111111111\n";
+        system("seq 8 > /tmp/1.txt");
+        std::string key = "my_config";
+        auto file_config = std::make_shared<HotConfig::FileConfig<MyConfig>>();
+        ASSERT_EQ(file_config->setInit(&MyConfig::initilization, true), true);
+        ASSERT_EQ(file_config->setLoad(&MyConfig::loadValue, "/tmp/1.txt"), true);
+        ASSERT_EQ(file_config->setWatch("/tmp/1.txt"), true);
+        ASSERT_EQ(file_config->load(), true);
+        ASSERT_EQ(file_config->setPassive(), true);
+        hotcmanager.start();
+        ASSERT_EQ(hotcmanager.add(key, file_config, true), true);
+        auto p = hotcmanager.get<HotConfig::FileConfig, MyConfig>(key);
+        std::cerr << p.get() << std::endl;
+        ASSERT_EQ(p.get()->vm.size(), 8);
+        system("seq 8 16 >> /tmp/1.txt; sleep 1");
+        p = hotcmanager.get<HotConfig::FileConfig, MyConfig>(key);
+        std::cerr << p.get() << std::endl;
+        ASSERT_EQ(p.get()->vm.size(), 16);
+    }
 }
 
 
