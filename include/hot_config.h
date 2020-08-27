@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/inotify.h>
+#include <sys/ioctl.h>
 #include <sys/epoll.h>
 #include <unistd.h>
 #include <queue>
@@ -30,6 +31,11 @@
 
 #include "thread_pool.h"
 
+#define SETBIT(x, y) x|=(1<<y)
+#define CLRBIT(x, y) x&=~(1<<y)
+#define BSETBIT(x, y) x=(~(~(0)<<y))
+
+
 namespace HotConfig {
     
 class BaseConfig {
@@ -41,9 +47,9 @@ class BaseConfig {
     
     virtual bool needUpdate() = 0;
 
-    virtual int getPassive() {
-        return -1;
-    };
+    virtual int getPassive() {return -1;}
+    
+    virtual bool passiveUpdate(int) { return true;}
 };
 
 
@@ -78,19 +84,46 @@ class FileConfig : public BaseConfig {
         if (file_path.empty()) {
             return false;
         }
-        if (!file_map_.count(file_path)) {
-            file_map_[file_path] = "";
-            file_detects_.emplace(file_path, func_detect);
+        return setWatch(std::vector<std::string>({file_path}),
+                        std::forward<decltype(func_detect)>(func_detect));
+    }
+    
+    bool setWatch(const std::vector<std::string> &file_vec,
+                  const std::function<bool(const std::string &,
+                      std::string &)> &&func_detect = fileMTimeUpdated) {
+        if (file_vec.empty()) {
+            return false;
+        }
+        if (file_vec.size() > 32) {
+            return false;
+        }
+        for (const std::string &file: file_vec) {
+            if (file.empty()) {
+                return false;
+            }
+        }
+        status_vec_.push_back(0);
+        files_vec_.push_back({});
+        for (int i = 0; i < file_vec.size(); ++i) {
+            auto &file = file_vec[i];
+            file_map_[file] = "";
+            files_vec_.back().emplace_back(file);
+            file_detects_.emplace(file, func_detect);
+            SETBIT(status_vec_.back(), i);
         }
         return true;
     }
 
-    bool setPassive(const std::function<bool(int&,
-                const std::map<std::string, std::string>)> &&func = fileInotify) {
-        return func(fd_, file_map_);
+    bool setPassive(const std::function<bool(const std::map<std::string, std::string> &,
+                                             std::map<int, std::string>&,
+                                             int&)> &&func = fileInotify,
+                    const std::function<bool(int, const std::map<int, std::string>&,
+                        std::set<std::string>&)> &&cb = fileInotifyCallback) {
+        passive_cb_ = std::move(cb);
+        return func(file_map_, fd_map_, fd_);
     }
     
-    virtual bool load() {
+    virtual bool load() override {
         auto new_config = std::make_shared<T>();
         if (init_func_ && !init_func_(new_config.get())) {
             return false;
@@ -103,21 +136,58 @@ class FileConfig : public BaseConfig {
         return true;
     }
     
-    virtual bool needUpdate() {
-        for (auto &p: file_map_) {
-            if (!file_detects_.count(p.first)) {
+    virtual bool needUpdate() override {
+        for (int i = 0; i < files_vec_.size(); ++i) {
+            const auto &file_vec = files_vec_[i];
+            if (file_vec.empty()) {
                 continue;
             }
-            auto &&func_detect = file_detects_[p.first];
-            if (func_detect(p.first, p.second)) {
+            int fsize = file_vec.size();
+            for (int j = 0; j < fsize; ++j) {
+                const std::string &file = file_vec[j];
+                if (!file_detects_.count(file)) {
+                    continue;
+                }
+                auto &func_detect = file_detects_[file];
+                if (func_detect(file, file_map_[file])) {
+                    CLRBIT(status_vec_[i], j);
+                }
+            }
+            if (!status_vec_[i]) {
+                BSETBIT(status_vec_[i], fsize);
                 return true;
             }
         }
         return false;
     }
 
-    virtual int getPassive() {
+    virtual int getPassive() override {
         return fd_;
+    }
+
+    virtual bool passiveUpdate(int fd) override {
+        std::set<std::string> update_set;
+        if (!passive_cb_(fd, fd_map_, update_set)) {
+            return false;
+        }
+        bool update = false;
+        for (int i = 0; i < files_vec_.size(); ++i) {
+            const auto &file_vec = files_vec_[i];
+            if (file_vec.empty()) {
+                continue;
+            }
+            int fsize = file_vec.size();
+            for (int j = 0; j < fsize; ++j) {
+                if (update_set.count(file_vec[j])) {
+                    CLRBIT(status_vec_[i], j);
+                }
+            }
+            if (!status_vec_[i]) {
+                BSETBIT(status_vec_[i], fsize);
+                update = true;
+            }
+        }
+        return update;
     }
 
     std::shared_ptr<T> get() {
@@ -143,30 +213,59 @@ class FileConfig : public BaseConfig {
         return true;
     }
 
-    static bool fileInotify(int &fd, const std::map<std::string, std::string> &files) {
+    static bool fileInotify(const std::map<std::string, std::string> &files, 
+                            std::map<int, std::string> &fd_map, int &fd) {
         fd = inotify_init();
         if (fd == -1) {
             return false;
         }
+        fd_map.clear();
         for (auto &p: files) {
-            int ret = inotify_add_watch(fd, p.first.c_str(), IN_CREATE|IN_MODIFY);
-            if (ret == -1) {
+            int wd = inotify_add_watch(fd, p.first.c_str(), IN_CREATE|IN_MODIFY);
+            if (wd == -1) {
+                fd_map.clear();
                 fd = -1;
                 return false;
             }
+            fd_map[wd] = p.first;
         }
+        return true;
+    }
+
+    static bool fileInotifyCallback(int fd,
+                                  const std::map<int, std::string> &fd_map,
+                                  std::set<std::string> &update_files) {
+       	unsigned int avail;
+		ioctl(fd, FIONREAD, &avail);
+		char *buffer = (char*)calloc(avail, sizeof(char));
+		int len = read(fd, buffer, avail);
+		int offset = 0;
+        std::set<std::string> update_set;
+		while (offset < len) {
+		    struct inotify_event *event = (inotify_event*)(buffer + offset);
+            if (fd_map.count(event->wd)) {
+                update_files.insert(fd_map.find(event->wd)->second);
+            }
+		    offset = offset + sizeof(inotify_event) + event->len;
+		}
+        free(buffer);
         return true;
     }
 
   private:
     int fd_;
     std::mutex mutex_;
+    std::vector<std::vector<std::string>> files_vec_;
+    std::vector<int> status_vec_;
     std::map<std::string, std::string> file_map_;
+    std::map<int, std::string> fd_map_;
     std::map<std::string,
              std::function<bool(const std::string&, std::string &)>> file_detects_;
     std::shared_ptr<T> config_ptr_;
     std::function<bool(T*)> init_func_;
     std::function<bool(T*)> load_func_;
+    std::function<bool(int, const std::map<int, std::string>&,
+                       std::set<std::string>&)> passive_cb_;
 };
 
 
@@ -282,7 +381,6 @@ class HotConfigManager {
         if (pipe(stop_pipe_) == -1 || !addPassive(stop_pipe_[0])) {
             return false;
         }
-        char buffer[1024];
         struct epoll_event events[10];
         while (true) {
             int nfds = epoll_wait(epoll_fd_, events, 10, -1);
@@ -300,9 +398,10 @@ class HotConfigManager {
                 if (!fd_map_.count(fd)) {
                     epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, &events[i]);
                 } else {
-                    read(fd, (void*)buffer, 1024);
                     auto config_ptr = config_pool_[fd_map_[fd]];
-                    reload_pool_->push([config_ptr](){config_ptr->load();});
+                    if (config_ptr->passiveUpdate(fd)) {
+                        reload_pool_->push([config_ptr](){config_ptr->load();});
+                    }
                 }
             }
         }
