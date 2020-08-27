@@ -87,5 +87,5 @@ int main() {
 ## 计划
 1. 单线程检测, 线程池实际加载  :heavy_check_mark:
 2. 支持事件驱动更新:heavy_check_mark:
-3. 支持外部手动触发调度更新
-4. 支持多文件watch, 同时更新出发reload或任意更新触发reload
+3. 支持多文件watch, 同时更新出发reload或任意更新触发reload:heavy_check_mark:
+4. 支持外部手动触发调度更新
