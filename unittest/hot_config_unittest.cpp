@@ -32,7 +32,7 @@ class MyConfig {
         }
         return true;
     }
-
+    
   public:
     std::map<std::string, size_t> vm;
 };
@@ -91,6 +91,43 @@ TEST_F(HotConfigTest, FileConfig) {
         auto vp = my_config.get();
         ASSERT_EQ(vp->size(), 8);
     }
+    {
+        system("seq 8 > /tmp/1.txt");
+        system("seq 8 16 > /tmp/2.txt");
+        HotConfig::FileConfig<std::vector<std::string>> my_config(
+                [](std::vector<std::string> *c) {return true;},
+                [](std::vector<std::string> *c) {
+                    std::cerr << "init by instruction func" << std::endl;
+                    std::ifstream ifs("/tmp/1.txt");
+                    std::string line;
+                    if (ifs.is_open()) {
+                        while (std::getline(ifs, line)) {
+                            c->push_back(std::move(line));
+                        }
+                    }
+                    ifs.close();
+                    ifs.open("/tmp/2.txt");
+                    if (ifs.is_open()) {
+                        while (std::getline(ifs, line)) {
+                            c->push_back(std::move(line));
+                        }
+                    }
+                    std::cerr << c->size() << std::endl;
+                    return true;
+                });
+        my_config.setWatch(std::vector<std::string>({"/tmp/1.txt", "/tmp/2.txt"}));
+        ASSERT_EQ(my_config.needUpdate(), true);
+        ASSERT_EQ(my_config.load(), true);
+        auto vp = my_config.get();
+        ASSERT_EQ(vp->size(), 17);
+        system("sleep 2 && seq 16 24 > /tmp/1.txt");
+        ASSERT_EQ(my_config.needUpdate(), false);
+        system("sleep 2 && seq 24 34 > /tmp/2.txt");
+        ASSERT_EQ(my_config.needUpdate(), true);
+        ASSERT_EQ(my_config.load(), true);
+        vp = my_config.get();
+        ASSERT_EQ(vp->size(), 20);
+    }
 }
 
 
@@ -136,6 +173,30 @@ TEST_F(HotConfigTest, HotConfigManager) {
         std::cerr << p.get() << std::endl;
         ASSERT_EQ(p.get()->vm.size(), 8);
         system("seq 8 16 >> /tmp/1.txt; sleep 1");
+        p = hotcmanager.get<HotConfig::FileConfig, MyConfig>(key);
+        std::cerr << p.get() << std::endl;
+        ASSERT_EQ(p.get()->vm.size(), 16);
+    }
+    {
+        std::cerr << "222222222222222222222222222222\n";
+        system("seq 8 > /tmp/1.txt");
+        std::string key = "my_config";
+        auto file_config = std::make_shared<HotConfig::FileConfig<MyConfig>>();
+        ASSERT_EQ(file_config->setInit(&MyConfig::initilization, true), true);
+        ASSERT_EQ(file_config->setLoad(&MyConfig::loadValue, "/tmp/1.txt"), true);
+        ASSERT_EQ(file_config->setWatch(std::vector<std::string>({"/tmp/1.txt", "/tmp/2.txt"})), true);
+        ASSERT_EQ(file_config->load(), true);
+        ASSERT_EQ(file_config->setPassive(), true);
+        hotcmanager.start();
+        ASSERT_EQ(hotcmanager.add(key, file_config, true), true);
+        auto p = hotcmanager.get<HotConfig::FileConfig, MyConfig>(key);
+        std::cerr << p.get() << std::endl;
+        ASSERT_EQ(p.get()->vm.size(), 8);
+        system("seq 8 16 >> /tmp/1.txt; sleep 1");
+        p = hotcmanager.get<HotConfig::FileConfig, MyConfig>(key);
+        std::cerr << p.get() << std::endl;
+        ASSERT_EQ(p.get()->vm.size(), 8);
+        system("seq 1 >> /tmp/2.txt; sleep 1");
         p = hotcmanager.get<HotConfig::FileConfig, MyConfig>(key);
         std::cerr << p.get() << std::endl;
         ASSERT_EQ(p.get()->vm.size(), 16);
