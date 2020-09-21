@@ -14,6 +14,7 @@
 #include <sys/ioctl.h>
 #include <sys/epoll.h>
 #include <unistd.h>
+#include <ctime>
 #include <queue>
 #include <string>
 #include <type_traits>
@@ -40,7 +41,7 @@ namespace HotConfig {
     
 class BaseConfig {
   public:
-    BaseConfig() {}
+    BaseConfig() : min_second_(0), last_load_(0) {}
     ~BaseConfig() {}
     
     virtual bool load() = 0;
@@ -50,6 +51,24 @@ class BaseConfig {
     virtual int getPassive() {return -1;}
     
     virtual bool passiveUpdate(int) { return true;}
+
+    inline bool validLoad() {
+        return min_second_ <= (std::time(NULL) - last_load_);
+    }
+
+    inline bool setMinSecond(int ms) {
+        min_second_ = ms;
+        return true;
+    }
+    
+    inline bool setLastLoad(std::time_t last_load = std::time(NULL)) {
+        last_load_ = last_load;
+        return true;
+    }
+  
+  protected:
+    int min_second_;
+    std::atomic<std::time_t> last_load_;
 };
 
 
@@ -124,6 +143,9 @@ class FileConfig : public BaseConfig {
     }
     
     virtual bool load() override {
+        if (!validLoad()) {
+            return false;
+        }
         auto new_config = std::make_shared<T>();
         if (init_func_ && !init_func_(new_config.get())) {
             return false;
@@ -133,6 +155,7 @@ class FileConfig : public BaseConfig {
         }
         std::lock_guard<std::mutex> lock(mutex_);
         config_ptr_.swap(new_config);
+        setLastLoad();
         return true;
     }
     
@@ -235,19 +258,19 @@ class FileConfig : public BaseConfig {
     static bool fileInotifyCallback(int fd,
                                   const std::map<int, std::string> &fd_map,
                                   std::set<std::string> &update_files) {
-       	unsigned int avail;
-		ioctl(fd, FIONREAD, &avail);
-		char *buffer = (char*)calloc(avail, sizeof(char));
-		int len = read(fd, buffer, avail);
-		int offset = 0;
+        unsigned int avail;
+        ioctl(fd, FIONREAD, &avail);
+        char *buffer = (char*)calloc(avail, sizeof(char));
+        int len = read(fd, buffer, avail);
+        int offset = 0;
         std::set<std::string> update_set;
-		while (offset < len) {
-		    struct inotify_event *event = (inotify_event*)(buffer + offset);
+        while (offset < len) {
+            struct inotify_event *event = (inotify_event*)(buffer + offset);
             if (fd_map.count(event->wd)) {
                 update_files.insert(fd_map.find(event->wd)->second);
             }
-		    offset = offset + sizeof(inotify_event) + event->len;
-		}
+            offset = offset + sizeof(inotify_event) + event->len;
+        }
         free(buffer);
         return true;
     }
@@ -271,7 +294,8 @@ class FileConfig : public BaseConfig {
 
 class HotConfigManager {
   public:
-    HotConfigManager() : check_interval_(10), running_(false) {}
+    HotConfigManager(size_t pool_size = 4)
+        : pool_size_(pool_size), check_interval_(10), running_(false) {}
     HotConfigManager(const HotConfigManager&) = delete;
     HotConfigManager& operator=(const HotConfigManager&) = delete;
     ~HotConfigManager() {
@@ -285,7 +309,7 @@ class HotConfigManager {
         running_ = true;
         passive_thread_.reset(new std::thread(&HotConfigManager::passiveReload, this));
         cycle_thread_.reset(new std::thread(&HotConfigManager::cycleReload, this));
-        reload_pool_ = std::make_shared<HotConfig::ThreadPool>();
+        reload_pool_ = std::make_shared<HotConfig::ThreadPool>(pool_size_);
         reload_pool_->start();
         return true;
     }
@@ -422,6 +446,7 @@ class HotConfigManager {
   private:
     int epoll_fd_;
     int stop_pipe_[2];
+    size_t pool_size_;
     size_t check_interval_;
     std::atomic<bool> running_;
     std::shared_ptr<std::thread> passive_thread_;
